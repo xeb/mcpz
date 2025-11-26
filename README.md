@@ -1,5 +1,8 @@
 # mcpz
 
+[![Crates.io](https://img.shields.io/crates/v/mcpz.svg)](https://crates.io/crates/mcpz)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **This program should not exist.**
 
 There is absolutely no reason for anyone to ever use this. The MCP ecosystem already has perfectly fine tooling. You could just... read the documentation. Or memorize which packages are on npm vs PyPI vs crates.io. Or maintain a spreadsheet. Like a normal person.
@@ -37,29 +40,40 @@ cargo build --release
 mcpz search mcp-server-filesystem
 ```
 
-Shows all matching packages across all registries with version, description, author, publish date, and **download counts**:
+Shows all matching packages across all registries with version, description, author, publish date, and **download counts** (sorted by popularity):
 
 ```
-[1] mcp-server-filesystem v0.1.2
+Found 13 packages (sorted by popularity):
+
+[1] @modelcontextprotocol/sdk v1.23.0
+    Registry:    npm
+    Description: Model Context Protocol implementation for TypeScript
+    Author:      pcarleton
+    Published:   2025-11-25
+    Downloads:   36.1M
+
+[2] @modelcontextprotocol/server-filesystem v2025.11.25
+    Registry:    npm
+    Description: MCP server for filesystem access
+    Author:      pcarleton
+    Published:   2025-11-25
+    Downloads:   474.9K   <-- the official one, pick this
+
+[3] @latitude-data/supergateway v2.1.4
+    Registry:    npm
+    Description: Run MCP stdio servers over SSE or visa versa
+    Author:      gerardclos
+    Published:   2025-03-04
+    Downloads:   63.0K
+
+...
+
+[8] mcp-server-filesystem v0.1.2
     Registry:    crates.io
     Description: A comprehensive MCP server for filesystem operations
     Author:      See crates.io
     Published:   2025-09-22
     Downloads:   816
-
-[2] mcp-server-filesystem v0.1.0
-    Registry:    PyPI
-    Description: poneglyph
-    Author:      Your Name
-    Published:   2025-10-23
-    Downloads:   3.7K
-
-[3] @modelcontextprotocol/server-filesystem v2025.11.25
-    Registry:    npm
-    Description: MCP server for filesystem access
-    Author:      pcarleton
-    Published:   2025-11-25
-    Downloads:   474.9K   <-- probably pick this one
 ```
 
 ### Run a package
