@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/mcpz.svg)](https://crates.io/crates/mcpz)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**This program should not exist.**
+**This program should not exist. But it does, because MCP should be easy. (MCP-z, get it?)**
 
 There is absolutely no reason for anyone to ever use this. The MCP ecosystem already has perfectly fine tooling. You could just... read the documentation. Or memorize which packages are on npm vs PyPI vs crates.io. Or maintain a spreadsheet. Like a normal person.
 
