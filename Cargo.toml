@@ -1,0 +1,49 @@
+[package]
+name = "mcpz"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime MCP router tool for running MCP servers via npx, uvx, or cargo"
+license = "MIT"
+authors = ["Mark Kockerbeck <xeb@hey.com>"]
+repository = "https://github.com/xeb/mcpz"
+homepage = "https://longrunningagents.com"
+readme = "README.md"
+keywords = ["mcp", "cli", "router", "npx", "uvx"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "mcpz"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Terminal UI
+colored = "2"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Config/cache
+toml = "0.8"
+dirs = "5"
+
+# HTTP client for API requests
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+urlencoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

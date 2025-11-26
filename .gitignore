@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project-specific
+eunice.json
+my_mcp_servers.json
+prompt.txt
+creds.sh
+
+# Test artifacts
+test_data/
+test_prompt.txt
+test_mcp_config.json
+test_underscore_server.json
+*.cast
