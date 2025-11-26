@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Runtime MCP router tool for running MCP servers via npx, uvx, or cargo
 #[derive(Parser)]
@@ -42,6 +43,45 @@ enum Commands {
     },
     /// Clear the package cache
     ClearCache,
+    /// Run a built-in MCP server
+    Server {
+        #[command(subcommand)]
+        server_type: ServerType,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServerType {
+    /// Start an MCP server for shell command execution
+    Shell {
+        /// Working directory for command execution
+        #[arg(short = 'w', long, value_name = "PATH")]
+        working_dir: Option<PathBuf>,
+
+        /// Command execution timeout in seconds
+        #[arg(short = 't', long, default_value = "30")]
+        timeout: u64,
+
+        /// Shell to use for command execution
+        #[arg(short = 's', long, default_value = "/bin/sh")]
+        shell: String,
+
+        /// Only allow commands matching these patterns (comma-separated)
+        #[arg(long, value_name = "PATTERNS")]
+        allow: Option<String>,
+
+        /// Deny commands matching these patterns (comma-separated)
+        #[arg(long, value_name = "PATTERNS")]
+        deny: Option<String>,
+
+        /// Suppress stderr in command output
+        #[arg(long)]
+        no_stderr: bool,
+
+        /// Enable verbose logging to stderr
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
 }
 
 /// Determines the package type based on the package name
@@ -993,6 +1033,377 @@ fn pick_package(query: &str) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// MCP Shell Server Implementation
+// ============================================================================
+
+/// Configuration for the shell server
+struct ShellServerConfig {
+    working_dir: Option<PathBuf>,
+    timeout: Duration,
+    shell: String,
+    allow_patterns: Vec<String>,
+    deny_patterns: Vec<String>,
+    include_stderr: bool,
+    verbose: bool,
+}
+
+impl ShellServerConfig {
+    fn from_args(
+        working_dir: Option<PathBuf>,
+        timeout: u64,
+        shell: String,
+        allow: Option<String>,
+        deny: Option<String>,
+        no_stderr: bool,
+        verbose: bool,
+    ) -> Self {
+        Self {
+            working_dir,
+            timeout: Duration::from_secs(timeout),
+            shell,
+            allow_patterns: allow
+                .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+                .unwrap_or_default(),
+            deny_patterns: deny
+                .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+                .unwrap_or_default(),
+            include_stderr: !no_stderr,
+            verbose,
+        }
+    }
+
+    fn is_command_allowed(&self, command: &str) -> bool {
+        // Check deny list first
+        for pattern in &self.deny_patterns {
+            if Self::matches_pattern(command, pattern) {
+                return false;
+            }
+        }
+
+        // If allow list is empty, allow all (that aren't denied)
+        if self.allow_patterns.is_empty() {
+            return true;
+        }
+
+        // Check allow list
+        for pattern in &self.allow_patterns {
+            if Self::matches_pattern(command, pattern) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn matches_pattern(command: &str, pattern: &str) -> bool {
+        // Simple wildcard matching: "ls*" matches "ls -la"
+        let cmd_first_word = command.split_whitespace().next().unwrap_or("");
+        if pattern.ends_with('*') {
+            let prefix = &pattern[..pattern.len() - 1];
+            cmd_first_word.starts_with(prefix)
+        } else {
+            cmd_first_word == pattern
+        }
+    }
+}
+
+/// JSON-RPC request structure
+#[derive(Deserialize)]
+struct JsonRpcRequest {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    id: Option<serde_json::Value>,
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+/// JSON-RPC response structure
+#[derive(Serialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<JsonRpcError>,
+}
+
+/// JSON-RPC error structure
+#[derive(Serialize)]
+struct JsonRpcError {
+    code: i32,
+    message: String,
+}
+
+/// Command execution result
+#[derive(Serialize)]
+struct ShellCommandResult {
+    command: String,
+    output: String,
+    return_code: i32,
+}
+
+/// Execute a shell command with the given config
+fn execute_shell_command(command: &str, config: &ShellServerConfig) -> ShellCommandResult {
+    // Check sandboxing rules
+    if !config.is_command_allowed(command) {
+        if config.verbose {
+            eprintln!("[mcpz] Command denied by security policy: {}", command);
+        }
+        return ShellCommandResult {
+            command: command.to_string(),
+            output: "Command denied by security policy".to_string(),
+            return_code: -1,
+        };
+    }
+
+    if config.verbose {
+        eprintln!("[mcpz] Executing: {}", command);
+    }
+
+    let mut cmd = Command::new(&config.shell);
+    cmd.arg("-c").arg(command);
+
+    // Set working directory if specified
+    if let Some(ref dir) = config.working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let output = cmd.output();
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let combined = if config.include_stderr {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                format!("{}{}", stdout, stderr)
+            } else {
+                stdout.to_string()
+            };
+
+            let return_code = output.status.code().unwrap_or(-1);
+
+            if config.verbose {
+                eprintln!("[mcpz] Exit code: {}", return_code);
+            }
+
+            ShellCommandResult {
+                command: command.to_string(),
+                output: combined,
+                return_code,
+            }
+        }
+        Err(e) => {
+            if config.verbose {
+                eprintln!("[mcpz] Error: {}", e);
+            }
+            ShellCommandResult {
+                command: command.to_string(),
+                output: format!("Failed to execute: {}", e),
+                return_code: -1,
+            }
+        }
+    }
+}
+
+/// Handle the initialize request
+fn handle_initialize() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "mcpz-shell",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    })
+}
+
+/// Handle the tools/list request
+fn handle_tools_list() -> serde_json::Value {
+    serde_json::json!({
+        "tools": [{
+            "name": "execute_command",
+            "description": "Execute a shell command and return its output",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute"
+                    }
+                },
+                "required": ["command"]
+            }
+        }]
+    })
+}
+
+/// Handle the tools/call request
+fn handle_tools_call(params: &serde_json::Value, config: &ShellServerConfig) -> Result<serde_json::Value> {
+    let name = params.get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing tool name"))?;
+
+    if name != "execute_command" {
+        return Err(anyhow!("Unknown tool: {}", name));
+    }
+
+    let command = params.get("arguments")
+        .and_then(|a| a.get("command"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| anyhow!("Missing command argument"))?;
+
+    let result = execute_shell_command(command, config);
+
+    Ok(serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&result)?
+        }]
+    }))
+}
+
+/// Handle a JSON-RPC request
+fn handle_mcp_request(req: JsonRpcRequest, config: &ShellServerConfig) -> Option<JsonRpcResponse> {
+    match req.method.as_str() {
+        "initialize" => {
+            Some(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: req.id,
+                result: Some(handle_initialize()),
+                error: None,
+            })
+        }
+        "initialized" => {
+            // Notification - no response
+            None
+        }
+        "notifications/initialized" => {
+            // Alternative notification format - no response
+            None
+        }
+        "tools/list" => {
+            Some(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: req.id,
+                result: Some(handle_tools_list()),
+                error: None,
+            })
+        }
+        "tools/call" => {
+            match handle_tools_call(&req.params, config) {
+                Ok(result) => Some(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id,
+                    result: Some(result),
+                    error: None,
+                }),
+                Err(e) => Some(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32603,
+                        message: e.to_string(),
+                    }),
+                }),
+            }
+        }
+        _ => {
+            Some(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: req.id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32601,
+                    message: format!("Method not found: {}", req.method),
+                }),
+            })
+        }
+    }
+}
+
+/// Run the MCP shell server
+fn run_shell_server(config: ShellServerConfig) -> Result<()> {
+    if config.verbose {
+        eprintln!("[mcpz] Shell server started");
+        eprintln!("[mcpz] Working dir: {:?}", config.working_dir);
+        eprintln!("[mcpz] Shell: {}", config.shell);
+        eprintln!("[mcpz] Timeout: {:?}", config.timeout);
+        if !config.allow_patterns.is_empty() {
+            eprintln!("[mcpz] Allow patterns: {:?}", config.allow_patterns);
+        }
+        if !config.deny_patterns.is_empty() {
+            eprintln!("[mcpz] Deny patterns: {:?}", config.deny_patterns);
+        }
+    }
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                if config.verbose {
+                    eprintln!("[mcpz] Error reading stdin: {}", e);
+                }
+                break;
+            }
+        };
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if config.verbose {
+            eprintln!("[mcpz] Received: {}", line);
+        }
+
+        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                if config.verbose {
+                    eprintln!("[mcpz] Parse error: {}", e);
+                }
+                let error_response = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: {}", e),
+                    }),
+                };
+                let response_json = serde_json::to_string(&error_response)?;
+                writeln!(stdout, "{}", response_json)?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+
+        if let Some(response) = handle_mcp_request(request, &config) {
+            let response_json = serde_json::to_string(&response)?;
+            if config.verbose {
+                eprintln!("[mcpz] Sending: {}", response_json);
+            }
+            writeln!(stdout, "{}", response_json)?;
+            stdout.flush()?;
+        }
+    }
+
+    if config.verbose {
+        eprintln!("[mcpz] Shell server stopped");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1004,6 +1415,30 @@ fn main() -> Result<()> {
             PackageCache::clear()?;
             println!("{}", "✓ Cache cleared".green());
             Ok(())
+        }
+        Commands::Server { server_type } => {
+            match server_type {
+                ServerType::Shell {
+                    working_dir,
+                    timeout,
+                    shell,
+                    allow,
+                    deny,
+                    no_stderr,
+                    verbose,
+                } => {
+                    let config = ShellServerConfig::from_args(
+                        working_dir,
+                        timeout,
+                        shell,
+                        allow,
+                        deny,
+                        no_stderr,
+                        verbose,
+                    );
+                    run_shell_server(config)
+                }
+            }
         }
     }
 }
@@ -1140,5 +1575,168 @@ mod tests {
             deserialized.get("another"),
             Some(("another-pkg".to_string(), PackageType::Npm))
         );
+    }
+
+    // Shell server tests
+
+    #[test]
+    fn test_cli_parse_server_shell() {
+        let cli = Cli::parse_from(["mcpz", "server", "shell"]);
+        match cli.command {
+            Commands::Server { server_type } => {
+                match server_type {
+                    ServerType::Shell { working_dir, timeout, shell, allow, deny, no_stderr, verbose } => {
+                        assert!(working_dir.is_none());
+                        assert_eq!(timeout, 30);
+                        assert_eq!(shell, "/bin/sh");
+                        assert!(allow.is_none());
+                        assert!(deny.is_none());
+                        assert!(!no_stderr);
+                        assert!(!verbose);
+                    }
+                }
+            }
+            _ => panic!("Expected Server command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_server_shell_with_options() {
+        let cli = Cli::parse_from([
+            "mcpz", "server", "shell",
+            "--working-dir", "/tmp",
+            "--timeout", "60",
+            "--shell", "/bin/bash",
+            "--allow", "ls*,cat*",
+            "--deny", "rm*,sudo*",
+            "--no-stderr",
+            "--verbose",
+        ]);
+        match cli.command {
+            Commands::Server { server_type } => {
+                match server_type {
+                    ServerType::Shell { working_dir, timeout, shell, allow, deny, no_stderr, verbose } => {
+                        assert_eq!(working_dir, Some(PathBuf::from("/tmp")));
+                        assert_eq!(timeout, 60);
+                        assert_eq!(shell, "/bin/bash");
+                        assert_eq!(allow, Some("ls*,cat*".to_string()));
+                        assert_eq!(deny, Some("rm*,sudo*".to_string()));
+                        assert!(no_stderr);
+                        assert!(verbose);
+                    }
+                }
+            }
+            _ => panic!("Expected Server command"),
+        }
+    }
+
+    #[test]
+    fn test_shell_config_pattern_matching() {
+        // Test wildcard matching
+        assert!(ShellServerConfig::matches_pattern("ls -la", "ls*"));
+        assert!(ShellServerConfig::matches_pattern("ls", "ls*"));
+        assert!(ShellServerConfig::matches_pattern("lsblk", "ls*"));
+        assert!(!ShellServerConfig::matches_pattern("cat file", "ls*"));
+
+        // Test exact matching
+        assert!(ShellServerConfig::matches_pattern("ls -la", "ls"));
+        assert!(!ShellServerConfig::matches_pattern("lsblk", "ls"));
+    }
+
+    #[test]
+    fn test_shell_config_is_command_allowed() {
+        // No restrictions - allow all
+        let config = ShellServerConfig::from_args(None, 30, "/bin/sh".to_string(), None, None, false, false);
+        assert!(config.is_command_allowed("ls -la"));
+        assert!(config.is_command_allowed("rm -rf /"));
+
+        // Only allow list
+        let config = ShellServerConfig::from_args(None, 30, "/bin/sh".to_string(), Some("ls*,cat*".to_string()), None, false, false);
+        assert!(config.is_command_allowed("ls -la"));
+        assert!(config.is_command_allowed("cat file"));
+        assert!(!config.is_command_allowed("rm file"));
+
+        // Only deny list
+        let config = ShellServerConfig::from_args(None, 30, "/bin/sh".to_string(), None, Some("rm*,sudo*".to_string()), false, false);
+        assert!(config.is_command_allowed("ls -la"));
+        assert!(!config.is_command_allowed("rm file"));
+        assert!(!config.is_command_allowed("sudo ls"));
+
+        // Both allow and deny - deny takes precedence
+        let config = ShellServerConfig::from_args(None, 30, "/bin/sh".to_string(), Some("*".to_string()), Some("rm*".to_string()), false, false);
+        assert!(!config.is_command_allowed("rm file"));
+    }
+
+    #[test]
+    fn test_execute_shell_command() {
+        let config = ShellServerConfig::from_args(None, 30, "/bin/sh".to_string(), None, None, false, false);
+        let result = execute_shell_command("echo hello", &config);
+        assert_eq!(result.command, "echo hello");
+        assert!(result.output.contains("hello"));
+        assert_eq!(result.return_code, 0);
+    }
+
+    #[test]
+    fn test_execute_shell_command_denied() {
+        let config = ShellServerConfig::from_args(None, 30, "/bin/sh".to_string(), Some("ls*".to_string()), None, false, false);
+        let result = execute_shell_command("rm file", &config);
+        assert_eq!(result.return_code, -1);
+        assert!(result.output.contains("denied"));
+    }
+
+    #[test]
+    fn test_handle_initialize() {
+        let result = handle_initialize();
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["serverInfo"]["name"], "mcpz-shell");
+    }
+
+    #[test]
+    fn test_handle_tools_list() {
+        let result = handle_tools_list();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "execute_command");
+    }
+
+    #[test]
+    fn test_handle_tools_call() {
+        let config = ShellServerConfig::from_args(None, 30, "/bin/sh".to_string(), None, None, false, false);
+        let params = serde_json::json!({
+            "name": "execute_command",
+            "arguments": {
+                "command": "echo test"
+            }
+        });
+        let result = handle_tools_call(&params, &config).unwrap();
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("test"));
+    }
+
+    #[test]
+    fn test_json_rpc_request_parsing() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.id, Some(serde_json::json!(1)));
+        assert_eq!(req.method, "initialize");
+    }
+
+    #[test]
+    fn test_json_rpc_response_serialization() {
+        let resp = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            result: Some(serde_json::json!({"test": true})),
+            error: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"jsonrpc\":\"2.0\""));
+        assert!(json.contains("\"id\":1"));
+        assert!(json.contains("\"test\":true"));
+        assert!(!json.contains("error"));
     }
 }

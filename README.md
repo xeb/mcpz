@@ -108,6 +108,53 @@ mcpz clear-cache
 
 Cache is stored at `~/.cache/mcpz/package_mapping.toml`
 
+### Built-in MCP Shell Server
+
+Run a built-in MCP server for shell command execution:
+
+```bash
+mcpz server shell
+```
+
+This starts an MCP-compliant server over stdio that LLM clients can use to execute shell commands. Configure it in Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "shell": {
+      "command": "mcpz",
+      "args": ["server", "shell"]
+    }
+  }
+}
+```
+
+**With sandboxing** (recommended for production):
+
+```json
+{
+  "mcpServers": {
+    "shell": {
+      "command": "mcpz",
+      "args": [
+        "server", "shell",
+        "--working-dir", "/home/user/projects",
+        "--allow", "ls*,cat*,grep*,find*",
+        "--deny", "rm*,sudo*,chmod*"
+      ]
+    }
+  }
+}
+```
+
+Options:
+- `--working-dir <PATH>` - Restrict execution to a directory
+- `--allow <PATTERNS>` - Only allow matching commands (comma-separated, wildcards supported)
+- `--deny <PATTERNS>` - Block matching commands (takes precedence over allow)
+- `--timeout <SECONDS>` - Command timeout (default: 30)
+- `--shell <PATH>` - Shell to use (default: /bin/sh)
+- `--verbose` - Enable debug logging to stderr
+
 ## How it works
 
 1. **Search order**: crates.io → PyPI → npm
