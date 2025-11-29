@@ -155,6 +155,59 @@ Options:
 - `--shell <PATH>` - Shell to use (default: /bin/sh)
 - `--verbose` - Enable debug logging to stderr
 
+### Built-in MCP Filesystem Server
+
+```bash
+mcpz server filesystem
+```
+
+Provides filesystem operations (read, write, list, search, etc.) with directory sandboxing:
+
+```bash
+mcpz server filesystem -d /home/user/projects -d /tmp
+```
+
+Options:
+- `-d, --dir <PATH>` - Allowed directory (can specify multiple times, defaults to current directory)
+- `--verbose` - Enable debug logging
+
+### HTTP Transport (Streamable HTTP)
+
+Both built-in servers support HTTP transport in addition to stdio, following the [MCP Streamable HTTP specification](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http):
+
+```bash
+# HTTP on localhost:3000
+mcpz server shell --http
+
+# Custom port and host
+mcpz server shell --http -p 8080 -H 0.0.0.0
+
+# HTTPS with auto-generated self-signed certificate
+mcpz server shell --http --tls
+
+# HTTPS with custom certificate
+mcpz server filesystem --http --tls --cert /path/to/cert.pem --key /path/to/key.pem
+```
+
+HTTP Transport Options:
+- `--http` - Use HTTP transport instead of stdio
+- `-p, --port <PORT>` - HTTP port (default: 3000)
+- `-H, --host <HOST>` - Bind address (default: 127.0.0.1)
+- `--tls` - Enable HTTPS (auto-generates self-signed cert if no --cert/--key)
+- `--cert <PATH>` - TLS certificate path (use with --key)
+- `--key <PATH>` - TLS private key path (use with --cert)
+- `--origin <ORIGINS>` - Allowed CORS origins (comma-separated)
+
+Test with curl:
+```bash
+# Initialize session
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+# Use mcp-session-id from response header for subsequent requests
+```
+
 ## How it works
 
 1. **Search order**: crates.io → PyPI → npm

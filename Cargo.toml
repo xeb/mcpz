@@ -1,6 +1,6 @@
 [package]
 name = "mcpz"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 description = "Runtime MCP router tool for running MCP servers via npx, uvx, or cargo"
 license = "MIT"
@@ -37,9 +37,36 @@ anyhow = "1"
 toml = "0.8"
 dirs = "5"
 
+# Date/time formatting
+chrono = "0.4"
+
 # HTTP client for API requests
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 urlencoding = "2"
+
+# HTTP server (for --http mode)
+axum = "0.7"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures = "0.3"
+
+# TLS support
+rcgen = "0.13"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+# UUID for session IDs
+uuid = { version = "1", features = ["v4"] }
+
+# SHA256 for cert fingerprint
+sha2 = "0.10"
+hex = "0.4"
+
+# Time for certificate validity
+time = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
