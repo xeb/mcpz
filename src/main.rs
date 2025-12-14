@@ -7,6 +7,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use servers::filesystem::FilesystemServerConfig;
 use servers::shell::ShellServerConfig;
+use servers::sql::{AccessMode, SqlServerConfig};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -48,8 +49,8 @@ enum Commands {
     },
     /// Clear the package cache
     ClearCache,
-    /// Run a built-in MCP server (shell, filesystem)
-    #[command(after_help = "Available servers:\n  shell       Execute shell commands\n  filesystem  Filesystem operations\n\nRun 'mcpz server <SERVER> --help' for server-specific options.")]
+    /// Run a built-in MCP server (shell, filesystem, sql)
+    #[command(after_help = "Available servers:\n  shell       Execute shell commands\n  filesystem  Filesystem operations\n  sql         SQL database queries\n\nRun 'mcpz server <SERVER> --help' for server-specific options.")]
     Server {
         /// List available built-in MCP servers
         #[arg(long, short = 'l')]
@@ -130,6 +131,80 @@ enum ServerType {
         /// Allowed directories (can specify multiple times, defaults to current directory)
         #[arg(short = 'd', long = "dir", value_name = "PATH")]
         allowed_directories: Vec<PathBuf>,
+
+        /// Enable verbose logging to stderr
+        #[arg(short = 'v', long)]
+        verbose: bool,
+
+        // HTTP transport options
+        /// Use HTTP transport instead of stdio
+        #[arg(long)]
+        http: bool,
+
+        /// Port to listen on (HTTP only)
+        #[arg(short = 'p', long, default_value = "3000")]
+        port: u16,
+
+        /// Address to bind to (HTTP only)
+        #[arg(short = 'H', long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Enable HTTPS (auto-generates self-signed cert if no --cert/--key)
+        #[arg(long)]
+        tls: bool,
+
+        /// Path to TLS certificate (PEM format)
+        #[arg(long, value_name = "PATH")]
+        cert: Option<PathBuf>,
+
+        /// Path to TLS private key (PEM format)
+        #[arg(long, value_name = "PATH")]
+        key: Option<PathBuf>,
+
+        /// Allowed origins for CORS (comma-separated)
+        #[arg(long, value_name = "ORIGINS")]
+        origin: Option<String>,
+    },
+
+    /// Start an MCP server for SQL database queries
+    #[command(after_help = r#"EXAMPLES:
+    # PostgreSQL (readonly - only SELECT allowed)
+    mcpz server sql --connection postgres://user:pass@localhost:5432/mydb --readonly
+
+    # MySQL with full access (SELECT, INSERT, UPDATE, DELETE)
+    mcpz server sql --connection mysql://user:pass@localhost:3306/mydb --fullaccess
+
+    # SQLite file database
+    mcpz server sql --connection sqlite:///path/to/database.db --readonly
+
+    # SQLite in-memory (for testing)
+    mcpz server sql --connection sqlite::memory: --fullaccess
+
+    # PostgreSQL over HTTPS
+    mcpz server sql --connection postgres://user:pass@localhost/db --readonly --http --tls
+
+SUPPORTED DATABASES:
+    PostgreSQL  postgres://user:pass@host:5432/database
+    MySQL       mysql://user:pass@host:3306/database
+    MariaDB     mysql://user:pass@host:3306/database (uses MySQL protocol)
+    SQLite      sqlite:///path/to/file.db or sqlite::memory:
+"#)]
+    Sql {
+        /// Database connection string (required)
+        #[arg(short = 'c', long, value_name = "URL", required = true)]
+        connection: String,
+
+        /// Read-only mode: only SELECT, SHOW, DESCRIBE allowed
+        #[arg(long, conflicts_with = "fullaccess", required_unless_present = "fullaccess")]
+        readonly: bool,
+
+        /// Full access mode: all SQL statements allowed (INSERT, UPDATE, DELETE, etc.)
+        #[arg(long, conflicts_with = "readonly", required_unless_present = "readonly")]
+        fullaccess: bool,
+
+        /// Query timeout in seconds
+        #[arg(short = 't', long, default_value = "30")]
+        timeout: u64,
 
         /// Enable verbose logging to stderr
         #[arg(short = 'v', long)]
@@ -1222,6 +1297,63 @@ fn main() -> Result<()> {
                         servers::run_filesystem_server(fs_config)
                     }
                 }
+                ServerType::Sql {
+                    connection,
+                    readonly,
+                    fullaccess: _,
+                    timeout,
+                    verbose,
+                    http,
+                    port,
+                    host,
+                    tls,
+                    cert,
+                    key,
+                    origin,
+                } => {
+                    let access_mode = if readonly {
+                        AccessMode::ReadOnly
+                    } else {
+                        AccessMode::FullAccess
+                    };
+
+                    let sql_config = SqlServerConfig::new(connection.clone(), access_mode, timeout, verbose);
+
+                    if http {
+                        // HTTP transport
+                        use servers::sql::SqlServer;
+
+                        // Install drivers and create pool
+                        sqlx::any::install_default_drivers();
+                        let rt = tokio::runtime::Runtime::new()?;
+                        let pool = rt.block_on(async {
+                            sqlx::any::AnyPoolOptions::new()
+                                .max_connections(5)
+                                .acquire_timeout(std::time::Duration::from_secs(timeout))
+                                .connect(&connection)
+                                .await
+                        }).context("Failed to connect to database")?;
+
+                        let host_addr: IpAddr = host.parse()
+                            .context("Invalid host address")?;
+                        let http_config = http::HttpServerConfig::new(
+                            port,
+                            host_addr,
+                            tls,
+                            cert,
+                            key,
+                            origin,
+                            verbose,
+                        );
+
+                        let server = SqlServer::new(sql_config, pool, rt);
+                        let rt2 = tokio::runtime::Runtime::new()?;
+                        rt2.block_on(http::run_http_server(server, http_config))
+                    } else {
+                        // stdio transport
+                        servers::run_sql_server(sql_config)
+                    }
+                }
             }
         }
         Commands::List => {
@@ -1252,6 +1384,16 @@ fn print_server_list() {
     println!("      -d, --dir <PATH>          Allowed directory (default: current dir, can repeat)");
     println!("      -v, --verbose             Enable debug logging");
     println!();
+    println!("  {} - SQL database queries", "sql".cyan());
+    println!("    Usage: mcpz server sql --connection <URL> --readonly|--fullaccess");
+    println!("    Server Options:");
+    println!("      -c, --connection <URL>    Database connection string (required)");
+    println!("      --readonly                Only allow SELECT queries");
+    println!("      --fullaccess              Allow all SQL statements");
+    println!("      -t, --timeout <SECONDS>   Query timeout (default: 30)");
+    println!("      -v, --verbose             Enable debug logging");
+    println!("    Supported databases: PostgreSQL, MySQL, MariaDB, SQLite");
+    println!();
     println!("{}", "HTTP Transport Options (add to any server):".yellow().bold());
     println!("      --http                    Use HTTP transport instead of stdio");
     println!("      -p, --port <PORT>         HTTP port (default: 3000)");
@@ -1266,6 +1408,12 @@ fn print_server_list() {
     println!("  mcpz server shell --http                  # HTTP on localhost:3000");
     println!("  mcpz server filesystem --http --tls       # HTTPS with self-signed cert");
     println!("  mcpz server shell --http -p 8080 --tls    # HTTPS on port 8080");
+    println!();
+    println!("{}", "SQL Examples:".green());
+    println!("  mcpz server sql -c postgres://user:pass@localhost/db --readonly");
+    println!("  mcpz server sql -c mysql://user:pass@localhost/db --fullaccess");
+    println!("  mcpz server sql -c sqlite:///path/to/file.db --readonly");
+    println!("  mcpz server sql -c sqlite::memory: --fullaccess");
     println!();
     println!("Run 'mcpz server <SERVER> --help' for more details.");
 }
@@ -1304,6 +1452,9 @@ fn print_full_list() -> Result<()> {
     println!();
     println!("  {} - Filesystem operations", "filesystem".cyan());
     println!("    Run: {}", "mcpz server filesystem".yellow());
+    println!();
+    println!("  {} - SQL database queries", "sql".cyan());
+    println!("    Run: {}", "mcpz server sql -c <connection> --readonly".yellow());
     println!();
     println!("Use 'mcpz server --list' for detailed server options.");
 
@@ -1671,6 +1822,131 @@ mod tests {
             Commands::Server { list, server_type } => {
                 assert!(list);
                 assert!(server_type.is_none());
+            }
+            _ => panic!("Expected Server command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_server_sql_readonly() {
+        let cli = Cli::parse_from([
+            "mcpz", "server", "sql",
+            "--connection", "postgres://user:pass@localhost:5432/mydb",
+            "--readonly",
+        ]);
+        match cli.command {
+            Commands::Server { list, server_type } => {
+                assert!(!list);
+                match server_type {
+                    Some(ServerType::Sql { connection, readonly, fullaccess, timeout, verbose, http, .. }) => {
+                        assert_eq!(connection, "postgres://user:pass@localhost:5432/mydb");
+                        assert!(readonly);
+                        assert!(!fullaccess);
+                        assert_eq!(timeout, 30);
+                        assert!(!verbose);
+                        assert!(!http);
+                    }
+                    _ => panic!("Expected Sql server type"),
+                }
+            }
+            _ => panic!("Expected Server command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_server_sql_fullaccess() {
+        let cli = Cli::parse_from([
+            "mcpz", "server", "sql",
+            "-c", "mysql://root:secret@localhost:3306/production",
+            "--fullaccess",
+            "--verbose",
+        ]);
+        match cli.command {
+            Commands::Server { list, server_type } => {
+                assert!(!list);
+                match server_type {
+                    Some(ServerType::Sql { connection, readonly, fullaccess, verbose, .. }) => {
+                        assert_eq!(connection, "mysql://root:secret@localhost:3306/production");
+                        assert!(!readonly);
+                        assert!(fullaccess);
+                        assert!(verbose);
+                    }
+                    _ => panic!("Expected Sql server type"),
+                }
+            }
+            _ => panic!("Expected Server command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_server_sql_sqlite() {
+        let cli = Cli::parse_from([
+            "mcpz", "server", "sql",
+            "-c", "sqlite:///tmp/test.db",
+            "--readonly",
+            "-t", "60",
+        ]);
+        match cli.command {
+            Commands::Server { list, server_type } => {
+                assert!(!list);
+                match server_type {
+                    Some(ServerType::Sql { connection, readonly, timeout, .. }) => {
+                        assert_eq!(connection, "sqlite:///tmp/test.db");
+                        assert!(readonly);
+                        assert_eq!(timeout, 60);
+                    }
+                    _ => panic!("Expected Sql server type"),
+                }
+            }
+            _ => panic!("Expected Server command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_server_sql_sqlite_memory() {
+        let cli = Cli::parse_from([
+            "mcpz", "server", "sql",
+            "-c", "sqlite::memory:",
+            "--fullaccess",
+        ]);
+        match cli.command {
+            Commands::Server { list, server_type } => {
+                assert!(!list);
+                match server_type {
+                    Some(ServerType::Sql { connection, fullaccess, .. }) => {
+                        assert_eq!(connection, "sqlite::memory:");
+                        assert!(fullaccess);
+                    }
+                    _ => panic!("Expected Sql server type"),
+                }
+            }
+            _ => panic!("Expected Server command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_server_sql_with_http() {
+        let cli = Cli::parse_from([
+            "mcpz", "server", "sql",
+            "-c", "postgres://localhost/db",
+            "--readonly",
+            "--http",
+            "-p", "8080",
+            "--tls",
+        ]);
+        match cli.command {
+            Commands::Server { list, server_type } => {
+                assert!(!list);
+                match server_type {
+                    Some(ServerType::Sql { connection, readonly, http, port, tls, .. }) => {
+                        assert_eq!(connection, "postgres://localhost/db");
+                        assert!(readonly);
+                        assert!(http);
+                        assert_eq!(port, 8080);
+                        assert!(tls);
+                    }
+                    _ => panic!("Expected Sql server type"),
+                }
             }
             _ => panic!("Expected Server command"),
         }

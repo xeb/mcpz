@@ -171,9 +171,69 @@ Options:
 - `-d, --dir <PATH>` - Allowed directory (can specify multiple times, defaults to current directory)
 - `--verbose` - Enable debug logging
 
+### Built-in MCP SQL Server
+
+Query SQL databases directly from your LLM:
+
+```bash
+# PostgreSQL (readonly - safest for production)
+mcpz server sql --connection postgres://user:pass@localhost:5432/mydb --readonly
+
+# MySQL with full access
+mcpz server sql --connection mysql://user:pass@localhost:3306/mydb --fullaccess
+
+# SQLite file database
+mcpz server sql --connection sqlite:///path/to/database.db --readonly
+
+# SQLite in-memory (for testing)
+mcpz server sql --connection sqlite::memory: --fullaccess
+```
+
+Configure in Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "sql": {
+      "command": "mcpz",
+      "args": [
+        "server", "sql",
+        "--connection", "postgres://user:pass@localhost:5432/mydb",
+        "--readonly"
+      ]
+    }
+  }
+}
+```
+
+**Supported Databases:**
+| Database   | Connection String Format |
+|------------|-------------------------|
+| PostgreSQL | `postgres://user:pass@host:5432/database` |
+| MySQL      | `mysql://user:pass@host:3306/database` |
+| MariaDB    | `mysql://user:pass@host:3306/database` |
+| SQLite     | `sqlite:///path/to/file.db` or `sqlite::memory:` |
+
+**Access Modes:**
+- `--readonly` - Only allows `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN` queries (recommended for production)
+- `--fullaccess` - Allows all SQL statements including `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`
+
+**Available Tools:**
+- `query` - Execute SELECT queries and return results
+- `list_tables` - List all tables in the database
+- `describe_table` - Get schema/structure of a table
+- `execute` - Execute write statements (only in `--fullaccess` mode)
+
+Options:
+- `-c, --connection <URL>` - Database connection string (required)
+- `--readonly` - Read-only mode (required if not `--fullaccess`)
+- `--fullaccess` - Full access mode (required if not `--readonly`)
+- `-t, --timeout <SECONDS>` - Query timeout (default: 30)
+- `--verbose` - Enable debug logging
+
 ### HTTP Transport (Streamable HTTP)
 
-Both built-in servers support HTTP transport in addition to stdio, following the [MCP Streamable HTTP specification](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http):
+All built-in servers support HTTP transport in addition to stdio, following the [MCP Streamable HTTP specification](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http):
 
 ```bash
 # HTTP on localhost:3000
@@ -187,6 +247,9 @@ mcpz server shell --http --tls
 
 # HTTPS with custom certificate
 mcpz server filesystem --http --tls --cert /path/to/cert.pem --key /path/to/key.pem
+
+# SQL server over HTTPS
+mcpz server sql -c postgres://user:pass@localhost/db --readonly --http --tls
 ```
 
 HTTP Transport Options:

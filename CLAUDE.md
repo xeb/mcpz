@@ -33,6 +33,7 @@ CLI application with modular structure for MCP server routing and built-in serve
 - `src/servers/common.rs` - Shared MCP types (`JsonRpcRequest`, `JsonRpcResponse`, `McpServer` trait)
 - `src/servers/shell.rs` - Shell command execution server
 - `src/servers/filesystem.rs` - Filesystem operations server
+- `src/servers/sql.rs` - SQL database query server
 - `src/http/mod.rs` - HTTP transport module exports
 - `src/http/server.rs` - Axum HTTP server setup, TLS config
 - `src/http/handlers.rs` - POST/GET/DELETE endpoint handlers
@@ -68,6 +69,7 @@ CLI application with modular structure for MCP server routing and built-in serve
 - `server list` - List available built-in MCP servers
 - `server shell` - Run built-in MCP shell server
 - `server filesystem` - Run built-in MCP filesystem server
+- `server sql` - Run built-in MCP SQL server
 
 ### Built-in MCP Servers
 
@@ -82,6 +84,21 @@ Provides filesystem operations with directory sandboxing.
 - `FilesystemServerConfig` - Allowed directories list
 - Path validation prevents access outside allowed directories (including symlink attacks)
 - Tools: `read_file`, `read_multiple_files`, `write_file`, `edit_file`, `create_directory`, `list_directory`, `list_directory_with_sizes`, `directory_tree`, `move_file`, `search_files`, `get_file_info`, `list_allowed_directories`
+
+#### SQL Server (`server sql`)
+Query SQL databases (PostgreSQL, MySQL, MariaDB, SQLite) via MCP.
+- `SqlServerConfig` - Connection string, access mode (readonly/fullaccess), timeout
+- `AccessMode::ReadOnly` - Only SELECT, SHOW, DESCRIBE, EXPLAIN allowed
+- `AccessMode::FullAccess` - All SQL statements allowed
+- Tools: `query`, `list_tables`, `describe_table`, `execute` (fullaccess only)
+- Uses `sqlx` with `AnyPool` for runtime database selection
+
+```bash
+mcpz server sql --connection postgres://user:pass@localhost:5432/db --readonly
+mcpz server sql --connection mysql://user:pass@localhost:3306/db --fullaccess
+mcpz server sql --connection sqlite:///path/to/file.db --readonly
+mcpz server sql --connection sqlite::memory: --fullaccess
+```
 
 ### HTTP Transport (`--http` flag)
 

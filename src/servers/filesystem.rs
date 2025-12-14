@@ -200,8 +200,25 @@ impl FilesystemServer {
 
     // Tool implementations
 
-    fn read_file(&self, path: &str, head: Option<usize>, tail: Option<usize>) -> Result<String> {
+    fn read_file(
+        &self,
+        path: &str,
+        head: Option<usize>,
+        tail: Option<usize>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<String> {
         let valid_path = validate_path(path, self.allowed_dirs())?;
+
+        // Check for conflicting parameters
+        let has_head_tail = head.is_some() || tail.is_some();
+        let has_offset_limit = offset.is_some() || limit.is_some();
+
+        if has_head_tail && has_offset_limit {
+            return Err(anyhow!(
+                "Cannot combine head/tail with offset/limit parameters"
+            ));
+        }
 
         if head.is_some() && tail.is_some() {
             return Err(anyhow!("Cannot specify both head and tail parameters"));
@@ -215,8 +232,35 @@ impl FilesystemServer {
             return self.head_file(&valid_path, n);
         }
 
+        if has_offset_limit {
+            return self.read_file_range(&valid_path, offset.unwrap_or(1), limit);
+        }
+
         fs::read_to_string(&valid_path)
             .with_context(|| format!("Failed to read file: {}", valid_path.display()))
+    }
+
+    fn read_file_range(&self, path: &Path, offset: usize, limit: Option<usize>) -> Result<String> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+
+        // offset is 1-indexed (line 1 is the first line)
+        let skip_lines = offset.saturating_sub(1);
+
+        let lines: Vec<String> = if let Some(n) = limit {
+            reader
+                .lines()
+                .skip(skip_lines)
+                .take(n)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            reader
+                .lines()
+                .skip(skip_lines)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(lines.join("\n"))
     }
 
     fn tail_file(&self, path: &Path, num_lines: usize) -> Result<String> {
@@ -279,11 +323,16 @@ impl FilesystemServer {
         Ok(lines.join("\n"))
     }
 
-    fn read_multiple_files(&self, paths: &[String]) -> Result<String> {
+    fn read_multiple_files(
+        &self,
+        paths: &[String],
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<String> {
         let results: Vec<String> = paths
             .iter()
             .map(|path| {
-                match self.read_file(path, None, None) {
+                match self.read_file(path, None, None, offset, limit) {
                     Ok(content) => format!("{}:\n{}\n", path, content),
                     Err(e) => format!("{}: Error - {}", path, e),
                 }
@@ -786,7 +835,7 @@ impl McpServer for FilesystemServer {
         vec![
             McpTool {
                 name: "read_file".to_string(),
-                description: "Read the contents of a file. Use 'head' to read first N lines or 'tail' to read last N lines.".to_string(),
+                description: "Read the contents of a file. Use 'head' to read first N lines, 'tail' to read last N lines, or 'offset'/'limit' to read a specific range of lines.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -796,11 +845,19 @@ impl McpServer for FilesystemServer {
                         },
                         "head": {
                             "type": "integer",
-                            "description": "Read only the first N lines"
+                            "description": "Read only the first N lines (cannot combine with offset/limit)"
                         },
                         "tail": {
                             "type": "integer",
-                            "description": "Read only the last N lines"
+                            "description": "Read only the last N lines (cannot combine with offset/limit)"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Line number to start reading from (1-indexed, cannot combine with head/tail)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to read (cannot combine with head/tail)"
                         }
                     },
                     "required": ["path"]
@@ -808,7 +865,7 @@ impl McpServer for FilesystemServer {
             },
             McpTool {
                 name: "read_multiple_files".to_string(),
-                description: "Read multiple files simultaneously. More efficient than reading one by one.".to_string(),
+                description: "Read multiple files simultaneously. More efficient than reading one by one. Supports offset/limit for reading specific line ranges from each file.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -816,6 +873,14 @@ impl McpServer for FilesystemServer {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Array of file paths to read"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Line number to start reading from in each file (1-indexed)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to read from each file"
                         }
                     },
                     "required": ["paths"]
@@ -1013,8 +1078,10 @@ impl McpServer for FilesystemServer {
                     .ok_or_else(|| anyhow!("Missing 'path' argument"))?;
                 let head = arguments.get("head").and_then(|v| v.as_u64()).map(|n| n as usize);
                 let tail = arguments.get("tail").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let offset = arguments.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let limit = arguments.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
 
-                match self.read_file(path, head, tail) {
+                match self.read_file(path, head, tail, offset, limit) {
                     Ok(content) => Ok(text_content(&content)),
                     Err(e) => Ok(error_content(&e.to_string())),
                 }
@@ -1026,8 +1093,10 @@ impl McpServer for FilesystemServer {
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
+                let offset = arguments.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let limit = arguments.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
 
-                match self.read_multiple_files(&paths) {
+                match self.read_multiple_files(&paths, offset, limit) {
                     Ok(content) => Ok(text_content(&content)),
                     Err(e) => Ok(error_content(&e.to_string())),
                 }
@@ -1221,7 +1290,7 @@ mod tests {
         writeln!(file, "line 2").unwrap();
         writeln!(file, "line 3").unwrap();
 
-        let content = server.read_file(file_path.to_str().unwrap(), None, None).unwrap();
+        let content = server.read_file(file_path.to_str().unwrap(), None, None, None, None).unwrap();
         assert!(content.contains("line 1"));
         assert!(content.contains("line 2"));
         assert!(content.contains("line 3"));
@@ -1236,7 +1305,7 @@ mod tests {
             writeln!(file, "line {}", i).unwrap();
         }
 
-        let content = server.read_file(file_path.to_str().unwrap(), Some(3), None).unwrap();
+        let content = server.read_file(file_path.to_str().unwrap(), Some(3), None, None, None).unwrap();
         assert!(content.contains("line 1"));
         assert!(content.contains("line 2"));
         assert!(content.contains("line 3"));
@@ -1253,11 +1322,142 @@ mod tests {
         }
         drop(file); // Ensure file is flushed and closed
 
-        let content = server.read_file(file_path.to_str().unwrap(), None, Some(3)).unwrap();
+        let content = server.read_file(file_path.to_str().unwrap(), None, Some(3), None, None).unwrap();
         // Should contain the last 3 lines (8, 9, 10)
         let lines: Vec<&str> = content.lines().collect();
         assert!(lines.len() <= 3, "Expected at most 3 lines, got {}", lines.len());
         assert!(content.contains("line 10"), "Should contain line 10");
+    }
+
+    #[test]
+    fn test_read_file_offset_limit() {
+        let (server, temp_dir) = create_test_server();
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).unwrap();
+        for i in 1..=10 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+
+        // Read lines 3-5 (offset=3, limit=3)
+        let content = server.read_file(file_path.to_str().unwrap(), None, None, Some(3), Some(3)).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(content.contains("line 3"));
+        assert!(content.contains("line 4"));
+        assert!(content.contains("line 5"));
+        assert!(!content.contains("line 2"));
+        assert!(!content.contains("line 6"));
+    }
+
+    #[test]
+    fn test_read_file_offset_only() {
+        let (server, temp_dir) = create_test_server();
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).unwrap();
+        for i in 1..=5 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+
+        // Read from line 3 to end
+        let content = server.read_file(file_path.to_str().unwrap(), None, None, Some(3), None).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(content.contains("line 3"));
+        assert!(content.contains("line 4"));
+        assert!(content.contains("line 5"));
+        assert!(!content.contains("line 1"));
+        assert!(!content.contains("line 2"));
+    }
+
+    #[test]
+    fn test_read_file_limit_only() {
+        let (server, temp_dir) = create_test_server();
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).unwrap();
+        for i in 1..=10 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+
+        // Read first 3 lines (limit only, defaults to offset=1)
+        let content = server.read_file(file_path.to_str().unwrap(), None, None, None, Some(3)).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(content.contains("line 1"));
+        assert!(content.contains("line 2"));
+        assert!(content.contains("line 3"));
+        assert!(!content.contains("line 4"));
+    }
+
+    #[test]
+    fn test_read_file_conflicting_params() {
+        let (server, temp_dir) = create_test_server();
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, "line 1").unwrap();
+
+        // Cannot combine head with offset
+        let result = server.read_file(file_path.to_str().unwrap(), Some(5), None, Some(1), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cannot combine"));
+
+        // Cannot combine tail with limit
+        let result = server.read_file(file_path.to_str().unwrap(), None, Some(5), None, Some(3));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cannot combine"));
+    }
+
+    #[test]
+    fn test_read_multiple_files() {
+        let (server, temp_dir) = create_test_server();
+
+        // Create two test files
+        let file1 = temp_dir.path().join("file1.txt");
+        let file2 = temp_dir.path().join("file2.txt");
+        let mut f1 = File::create(&file1).unwrap();
+        let mut f2 = File::create(&file2).unwrap();
+        writeln!(f1, "file1 content").unwrap();
+        writeln!(f2, "file2 content").unwrap();
+
+        let paths = vec![
+            file1.to_str().unwrap().to_string(),
+            file2.to_str().unwrap().to_string(),
+        ];
+        let content = server.read_multiple_files(&paths, None, None).unwrap();
+        assert!(content.contains("file1.txt"));
+        assert!(content.contains("file1 content"));
+        assert!(content.contains("file2.txt"));
+        assert!(content.contains("file2 content"));
+    }
+
+    #[test]
+    fn test_read_multiple_files_with_offset_limit() {
+        let (server, temp_dir) = create_test_server();
+
+        // Create two test files with multiple lines
+        let file1 = temp_dir.path().join("file1.txt");
+        let file2 = temp_dir.path().join("file2.txt");
+        let mut f1 = File::create(&file1).unwrap();
+        let mut f2 = File::create(&file2).unwrap();
+        for i in 1..=5 {
+            writeln!(f1, "file1 line {}", i).unwrap();
+            writeln!(f2, "file2 line {}", i).unwrap();
+        }
+
+        let paths = vec![
+            file1.to_str().unwrap().to_string(),
+            file2.to_str().unwrap().to_string(),
+        ];
+
+        // Read lines 2-3 from each file
+        let content = server.read_multiple_files(&paths, Some(2), Some(2)).unwrap();
+        assert!(content.contains("file1 line 2"));
+        assert!(content.contains("file1 line 3"));
+        assert!(!content.contains("file1 line 1"));
+        assert!(!content.contains("file1 line 4"));
+        assert!(content.contains("file2 line 2"));
+        assert!(content.contains("file2 line 3"));
+        assert!(!content.contains("file2 line 1"));
+        assert!(!content.contains("file2 line 4"));
     }
 
     #[test]
@@ -1363,7 +1563,7 @@ mod tests {
         let (server, _temp_dir) = create_test_server();
 
         // Try to access path outside allowed directory
-        let result = server.read_file("/etc/passwd", None, None);
+        let result = server.read_file("/etc/passwd", None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Access denied"));
     }
