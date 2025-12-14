@@ -7,7 +7,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use servers::filesystem::FilesystemServerConfig;
 use servers::shell::ShellServerConfig;
-use servers::sql::{AccessMode, SqlServerConfig};
+use servers::sql::{AccessMode, DatabaseType, SqlServerConfig, connect_database};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -1317,22 +1317,24 @@ fn main() -> Result<()> {
                         AccessMode::FullAccess
                     };
 
-                    let sql_config = SqlServerConfig::new(connection.clone(), access_mode, timeout, verbose);
+                    // Detect database type from connection string
+                    let db_type = DatabaseType::from_connection_string(&connection)
+                        .context("Invalid connection string")?;
+
+                    let sql_config = SqlServerConfig::new(connection.clone(), access_mode, timeout, verbose)
+                        .context("Failed to create SQL server config")?;
 
                     if http {
                         // HTTP transport
                         use servers::sql::SqlServer;
 
-                        // Install drivers and create pool
-                        sqlx::any::install_default_drivers();
+                        // Connect using native driver
                         let rt = tokio::runtime::Runtime::new()?;
-                        let pool = rt.block_on(async {
-                            sqlx::any::AnyPoolOptions::new()
-                                .max_connections(5)
-                                .acquire_timeout(std::time::Duration::from_secs(timeout))
-                                .connect(&connection)
-                                .await
-                        }).context("Failed to connect to database")?;
+                        let pool = rt.block_on(connect_database(
+                            &connection,
+                            db_type,
+                            std::time::Duration::from_secs(timeout),
+                        )).context("Failed to connect to database")?;
 
                         let host_addr: IpAddr = host.parse()
                             .context("Invalid host address")?;

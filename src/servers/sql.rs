@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-use sqlx::any::AnyRow;
-use sqlx::{AnyPool, Column, Row, TypeInfo};
+use sqlx::mysql::{MySqlPool, MySqlRow};
+use sqlx::postgres::{PgPool, PgRow};
+use sqlx::sqlite::{SqlitePool, SqliteRow};
+use sqlx::{Column, Row, TypeInfo};
 use std::time::Duration;
 
 use super::common::{error_content, text_content, McpServer, McpTool};
@@ -15,41 +17,65 @@ pub enum AccessMode {
     FullAccess,
 }
 
+/// Database type detected from connection string
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseType {
+    PostgreSQL,
+    MySQL,
+    SQLite,
+}
+
+impl DatabaseType {
+    /// Detect database type from connection string
+    pub fn from_connection_string(conn: &str) -> Result<Self> {
+        if conn.starts_with("postgres://") || conn.starts_with("postgresql://") {
+            Ok(DatabaseType::PostgreSQL)
+        } else if conn.starts_with("mysql://") || conn.starts_with("mariadb://") {
+            Ok(DatabaseType::MySQL)
+        } else if conn.starts_with("sqlite://") || conn.starts_with("sqlite:") {
+            Ok(DatabaseType::SQLite)
+        } else {
+            Err(anyhow!(
+                "Unsupported database type. Connection string must start with postgres://, mysql://, or sqlite://"
+            ))
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            DatabaseType::PostgreSQL => "PostgreSQL",
+            DatabaseType::MySQL => "MySQL",
+            DatabaseType::SQLite => "SQLite",
+        }
+    }
+}
+
+/// Native database pool - holds the specific driver's pool
+pub enum DatabasePool {
+    PostgreSQL(PgPool),
+    MySQL(MySqlPool),
+    SQLite(SqlitePool),
+}
+
 /// Configuration for the SQL server
 pub struct SqlServerConfig {
     pub connection_string: String,
     pub access_mode: AccessMode,
     pub timeout: Duration,
     pub verbose: bool,
+    pub db_type: DatabaseType,
 }
 
 impl SqlServerConfig {
-    pub fn new(connection_string: String, access_mode: AccessMode, timeout: u64, verbose: bool) -> Self {
-        Self {
+    pub fn new(connection_string: String, access_mode: AccessMode, timeout: u64, verbose: bool) -> Result<Self> {
+        let db_type = DatabaseType::from_connection_string(&connection_string)?;
+        Ok(Self {
             connection_string,
             access_mode,
             timeout: Duration::from_secs(timeout),
             verbose,
-        }
-    }
-
-    /// Detect database type from connection string
-    pub fn database_type(&self) -> &'static str {
-        if self.connection_string.starts_with("postgres://")
-            || self.connection_string.starts_with("postgresql://")
-        {
-            "PostgreSQL"
-        } else if self.connection_string.starts_with("mysql://")
-            || self.connection_string.starts_with("mariadb://")
-        {
-            "MySQL"
-        } else if self.connection_string.starts_with("sqlite://")
-            || self.connection_string.starts_with("sqlite:")
-        {
-            "SQLite"
-        } else {
-            "Unknown"
-        }
+            db_type,
+        })
     }
 
     /// Check if a SQL statement is allowed based on access mode
@@ -68,7 +94,7 @@ impl SqlServerConfig {
             || trimmed.starts_with("SHOW")
             || trimmed.starts_with("DESCRIBE")
             || trimmed.starts_with("DESC")
-            || trimmed.starts_with("PRAGMA")  // SQLite introspection
+            || trimmed.starts_with("PRAGMA") // SQLite introspection
     }
 }
 
@@ -102,15 +128,15 @@ pub struct ColumnInfo {
     pub is_nullable: bool,
 }
 
-/// SQL MCP server
+/// SQL MCP server with native driver support
 pub struct SqlServer {
     config: SqlServerConfig,
-    pool: AnyPool,
+    pool: DatabasePool,
     runtime: tokio::runtime::Runtime,
 }
 
 impl SqlServer {
-    pub fn new(config: SqlServerConfig, pool: AnyPool, runtime: tokio::runtime::Runtime) -> Self {
+    pub fn new(config: SqlServerConfig, pool: DatabasePool, runtime: tokio::runtime::Runtime) -> Self {
         Self {
             config,
             pool,
@@ -118,42 +144,162 @@ impl SqlServer {
         }
     }
 
-    /// Convert a row to JSON values
-    fn row_to_json(row: &AnyRow) -> Vec<serde_json::Value> {
+    /// Convert a PostgreSQL row to JSON values
+    fn pg_row_to_json(row: &PgRow) -> Vec<serde_json::Value> {
         let mut values = Vec::new();
         for i in 0..row.columns().len() {
             let col = &row.columns()[i];
             let type_name = col.type_info().name();
 
-            // Try to extract value based on type
-            let value: serde_json::Value = match type_name.to_uppercase().as_str() {
-                "INT" | "INT4" | "INTEGER" | "BIGINT" | "INT8" | "SMALLINT" | "INT2" => {
+            let value: serde_json::Value = match type_name {
+                "INT2" | "INT4" | "INT8" | "SERIAL" | "BIGSERIAL" => {
                     row.try_get::<i64, _>(i)
                         .map(serde_json::Value::from)
                         .unwrap_or(serde_json::Value::Null)
                 }
-                "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "REAL" | "NUMERIC" | "DECIMAL" => {
+                "FLOAT4" | "FLOAT8" | "NUMERIC" | "DECIMAL" => {
+                    row.try_get::<f64, _>(i)
+                        .map(serde_json::Value::from)
+                        .or_else(|_| {
+                            // Try as string for high-precision decimals
+                            row.try_get::<String, _>(i).map(serde_json::Value::from)
+                        })
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "BOOL" => {
+                    row.try_get::<bool, _>(i)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ" => {
+                    row.try_get::<String, _>(i)
+                        .map(serde_json::Value::from)
+                        .or_else(|_| {
+                            row.try_get::<chrono::NaiveDate, _>(i)
+                                .map(|d| serde_json::Value::from(d.to_string()))
+                        })
+                        .or_else(|_| {
+                            row.try_get::<chrono::NaiveDateTime, _>(i)
+                                .map(|d| serde_json::Value::from(d.to_string()))
+                        })
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "JSON" | "JSONB" => {
+                    row.try_get::<serde_json::Value, _>(i)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                _ => {
+                    // Default to string
+                    row.try_get::<String, _>(i)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            };
+            values.push(value);
+        }
+        values
+    }
+
+    /// Convert a MySQL row to JSON values
+    fn mysql_row_to_json(row: &MySqlRow) -> Vec<serde_json::Value> {
+        let mut values = Vec::new();
+        for i in 0..row.columns().len() {
+            let col = &row.columns()[i];
+            let type_name = col.type_info().name();
+
+            let value: serde_json::Value = match type_name {
+                "TINYINT" | "SMALLINT" | "INT" | "MEDIUMINT" | "BIGINT" => {
+                    row.try_get::<i64, _>(i)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "FLOAT" | "DOUBLE" => {
                     row.try_get::<f64, _>(i)
                         .map(serde_json::Value::from)
                         .unwrap_or(serde_json::Value::Null)
                 }
-                "BOOL" | "BOOLEAN" => {
+                "DECIMAL" | "NUMERIC" => {
+                    // MySQL DECIMAL - try as string first for precision
+                    row.try_get::<String, _>(i)
+                        .map(serde_json::Value::from)
+                        .or_else(|_| {
+                            row.try_get::<f64, _>(i).map(serde_json::Value::from)
+                        })
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "DATE" => {
+                    row.try_get::<chrono::NaiveDate, _>(i)
+                        .map(|d| serde_json::Value::from(d.to_string()))
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "TIME" => {
+                    row.try_get::<chrono::NaiveTime, _>(i)
+                        .map(|t| serde_json::Value::from(t.to_string()))
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "DATETIME" | "TIMESTAMP" => {
+                    row.try_get::<chrono::NaiveDateTime, _>(i)
+                        .map(|d| serde_json::Value::from(d.to_string()))
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "BOOLEAN" | "BOOL" => {
+                    row.try_get::<bool, _>(i)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "JSON" => {
+                    row.try_get::<serde_json::Value, _>(i)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                _ => {
+                    // VARCHAR, TEXT, CHAR, BLOB, etc. - try as string
+                    row.try_get::<String, _>(i)
+                        .map(serde_json::Value::from)
+                        .or_else(|_| {
+                            row.try_get::<Vec<u8>, _>(i)
+                                .map(|b| serde_json::Value::from(String::from_utf8_lossy(&b).to_string()))
+                        })
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            };
+            values.push(value);
+        }
+        values
+    }
+
+    /// Convert a SQLite row to JSON values
+    fn sqlite_row_to_json(row: &SqliteRow) -> Vec<serde_json::Value> {
+        let mut values = Vec::new();
+        for i in 0..row.columns().len() {
+            let col = &row.columns()[i];
+            let type_name = col.type_info().name().to_uppercase();
+
+            let value: serde_json::Value = match type_name.as_str() {
+                "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => {
+                    row.try_get::<i64, _>(i)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "REAL" | "FLOAT" | "DOUBLE" | "NUMERIC" | "DECIMAL" => {
+                    row.try_get::<f64, _>(i)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                "BOOLEAN" | "BOOL" => {
                     row.try_get::<bool, _>(i)
                         .map(serde_json::Value::from)
                         .unwrap_or(serde_json::Value::Null)
                 }
                 "NULL" => serde_json::Value::Null,
                 _ => {
-                    // Default to string for TEXT, VARCHAR, and other types
+                    // TEXT, BLOB, etc.
                     row.try_get::<String, _>(i)
                         .map(serde_json::Value::from)
-                        .unwrap_or_else(|_| {
-                            // Try as bytes and convert to string
+                        .or_else(|_| {
                             row.try_get::<Vec<u8>, _>(i)
-                                .map(|b| String::from_utf8_lossy(&b).to_string())
-                                .map(serde_json::Value::from)
-                                .unwrap_or(serde_json::Value::Null)
+                                .map(|b| serde_json::Value::from(String::from_utf8_lossy(&b).to_string()))
                         })
+                        .unwrap_or(serde_json::Value::Null)
                 }
             };
             values.push(value);
@@ -171,35 +317,44 @@ impl SqlServer {
 
         self.log(&format!("Executing query: {}", sql));
 
-        let result = self.runtime.block_on(async {
-            let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&self.pool).await?;
-
-            if rows.is_empty() {
-                return Ok(QueryResult {
-                    columns: vec![],
-                    rows: vec![],
-                    row_count: 0,
-                });
+        match &self.pool {
+            DatabasePool::PostgreSQL(pool) => {
+                self.runtime.block_on(async {
+                    let rows: Vec<PgRow> = sqlx::query(sql).fetch_all(pool).await?;
+                    if rows.is_empty() {
+                        return Ok(QueryResult { columns: vec![], rows: vec![], row_count: 0 });
+                    }
+                    let columns: Vec<String> = rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+                    let json_rows: Vec<Vec<serde_json::Value>> = rows.iter().map(Self::pg_row_to_json).collect();
+                    let row_count = json_rows.len();
+                    Ok(QueryResult { columns, rows: json_rows, row_count })
+                })
             }
-
-            let columns: Vec<String> = rows[0]
-                .columns()
-                .iter()
-                .map(|c| c.name().to_string())
-                .collect();
-
-            let json_rows: Vec<Vec<serde_json::Value>> =
-                rows.iter().map(Self::row_to_json).collect();
-            let row_count = json_rows.len();
-
-            Ok(QueryResult {
-                columns,
-                rows: json_rows,
-                row_count,
-            })
-        });
-
-        result
+            DatabasePool::MySQL(pool) => {
+                self.runtime.block_on(async {
+                    let rows: Vec<MySqlRow> = sqlx::query(sql).fetch_all(pool).await?;
+                    if rows.is_empty() {
+                        return Ok(QueryResult { columns: vec![], rows: vec![], row_count: 0 });
+                    }
+                    let columns: Vec<String> = rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+                    let json_rows: Vec<Vec<serde_json::Value>> = rows.iter().map(Self::mysql_row_to_json).collect();
+                    let row_count = json_rows.len();
+                    Ok(QueryResult { columns, rows: json_rows, row_count })
+                })
+            }
+            DatabasePool::SQLite(pool) => {
+                self.runtime.block_on(async {
+                    let rows: Vec<SqliteRow> = sqlx::query(sql).fetch_all(pool).await?;
+                    if rows.is_empty() {
+                        return Ok(QueryResult { columns: vec![], rows: vec![], row_count: 0 });
+                    }
+                    let columns: Vec<String> = rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+                    let json_rows: Vec<Vec<serde_json::Value>> = rows.iter().map(Self::sqlite_row_to_json).collect();
+                    let row_count = json_rows.len();
+                    Ok(QueryResult { columns, rows: json_rows, row_count })
+                })
+            }
+        }
     }
 
     /// Execute a statement (INSERT, UPDATE, DELETE, etc.)
@@ -212,52 +367,84 @@ impl SqlServer {
 
         self.log(&format!("Executing statement: {}", sql));
 
-        let result = self.runtime.block_on(async {
-            let result = sqlx::query(sql).execute(&self.pool).await?;
-            let rows_affected = result.rows_affected();
+        let rows_affected = match &self.pool {
+            DatabasePool::PostgreSQL(pool) => {
+                self.runtime.block_on(async {
+                    let result = sqlx::query(sql).execute(pool).await?;
+                    Ok::<u64, anyhow::Error>(result.rows_affected())
+                })?
+            }
+            DatabasePool::MySQL(pool) => {
+                self.runtime.block_on(async {
+                    let result = sqlx::query(sql).execute(pool).await?;
+                    Ok::<u64, anyhow::Error>(result.rows_affected())
+                })?
+            }
+            DatabasePool::SQLite(pool) => {
+                self.runtime.block_on(async {
+                    let result = sqlx::query(sql).execute(pool).await?;
+                    Ok::<u64, anyhow::Error>(result.rows_affected())
+                })?
+            }
+        };
 
-            Ok(ExecuteResult {
-                rows_affected,
-                message: format!("Statement executed successfully. {} row(s) affected.", rows_affected),
-            })
-        });
-
-        result
+        Ok(ExecuteResult {
+            rows_affected,
+            message: format!("Statement executed successfully. {} row(s) affected.", rows_affected),
+        })
     }
 
     /// List all tables in the database
     fn list_tables(&self) -> Result<Vec<TableInfo>> {
-        let sql = if self.config.connection_string.starts_with("postgres")
-            || self.config.connection_string.starts_with("postgresql")
-        {
-            "SELECT table_name as name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
-        } else if self.config.connection_string.starts_with("mysql")
-            || self.config.connection_string.starts_with("mariadb")
-        {
-            "SELECT table_name as name, table_type FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name"
-        } else {
-            // SQLite
-            "SELECT name, type as table_type FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name"
+        let sql = match self.config.db_type {
+            DatabaseType::PostgreSQL => {
+                "SELECT table_name as name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+            }
+            DatabaseType::MySQL => {
+                "SELECT table_name as name, table_type FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name"
+            }
+            DatabaseType::SQLite => {
+                "SELECT name, type as table_type FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name"
+            }
         };
 
         self.log(&format!("Listing tables with: {}", sql));
 
-        let result = self.runtime.block_on(async {
-            let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&self.pool).await?;
-
-            let tables: Vec<TableInfo> = rows
-                .iter()
-                .map(|row| {
-                    let name: String = row.try_get("name").unwrap_or_default();
-                    let table_type: String = row.try_get("table_type").unwrap_or_else(|_| "TABLE".to_string());
-                    TableInfo { name, table_type }
+        match &self.pool {
+            DatabasePool::PostgreSQL(pool) => {
+                self.runtime.block_on(async {
+                    let rows: Vec<PgRow> = sqlx::query(sql).fetch_all(pool).await?;
+                    let tables: Vec<TableInfo> = rows.iter().map(|row| {
+                        let name: String = row.try_get("name").unwrap_or_default();
+                        let table_type: String = row.try_get("table_type").unwrap_or_else(|_| "TABLE".to_string());
+                        TableInfo { name, table_type }
+                    }).collect();
+                    Ok(tables)
                 })
-                .collect();
-
-            Ok(tables)
-        });
-
-        result
+            }
+            DatabasePool::MySQL(pool) => {
+                self.runtime.block_on(async {
+                    let rows: Vec<MySqlRow> = sqlx::query(sql).fetch_all(pool).await?;
+                    let tables: Vec<TableInfo> = rows.iter().map(|row| {
+                        let name: String = row.try_get("name").unwrap_or_default();
+                        let table_type: String = row.try_get("table_type").unwrap_or_else(|_| "TABLE".to_string());
+                        TableInfo { name, table_type }
+                    }).collect();
+                    Ok(tables)
+                })
+            }
+            DatabasePool::SQLite(pool) => {
+                self.runtime.block_on(async {
+                    let rows: Vec<SqliteRow> = sqlx::query(sql).fetch_all(pool).await?;
+                    let tables: Vec<TableInfo> = rows.iter().map(|row| {
+                        let name: String = row.try_get("name").unwrap_or_default();
+                        let table_type: String = row.try_get("table_type").unwrap_or_else(|_| "TABLE".to_string());
+                        TableInfo { name, table_type }
+                    }).collect();
+                    Ok(tables)
+                })
+            }
+        }
     }
 
     /// Describe a table's schema
@@ -267,63 +454,71 @@ impl SqlServer {
             return Err(anyhow!("Invalid table name"));
         }
 
-        let sql = if self.config.connection_string.starts_with("postgres")
-            || self.config.connection_string.starts_with("postgresql")
-        {
-            format!(
-                "SELECT column_name as name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' ORDER BY ordinal_position",
-                table_name
-            )
-        } else if self.config.connection_string.starts_with("mysql")
-            || self.config.connection_string.starts_with("mariadb")
-        {
-            format!(
-                "SELECT column_name as name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' AND table_schema = DATABASE() ORDER BY ordinal_position",
-                table_name
-            )
-        } else {
-            // SQLite - use PRAGMA
-            format!("PRAGMA table_info({})", table_name)
-        };
+        match self.config.db_type {
+            DatabaseType::PostgreSQL => {
+                let sql = format!(
+                    "SELECT column_name as name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' ORDER BY ordinal_position",
+                    table_name
+                );
+                self.log(&format!("Describing table with: {}", sql));
 
-        self.log(&format!("Describing table with: {}", sql));
-
-        let result = self.runtime.block_on(async {
-            let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.pool).await?;
-
-            let columns: Vec<ColumnInfo> = if self.config.connection_string.starts_with("sqlite") {
-                // SQLite PRAGMA returns: cid, name, type, notnull, dflt_value, pk
-                rows.iter()
-                    .map(|row| {
-                        let name: String = row.try_get("name").unwrap_or_default();
-                        let data_type: String = row.try_get("type").unwrap_or_default();
-                        let notnull: i32 = row.try_get("notnull").unwrap_or(0);
-                        ColumnInfo {
-                            name,
-                            data_type,
-                            is_nullable: notnull == 0,
-                        }
+                if let DatabasePool::PostgreSQL(pool) = &self.pool {
+                    self.runtime.block_on(async {
+                        let rows: Vec<PgRow> = sqlx::query(&sql).fetch_all(pool).await?;
+                        let columns: Vec<ColumnInfo> = rows.iter().map(|row| {
+                            let name: String = row.try_get("name").unwrap_or_default();
+                            let data_type: String = row.try_get("data_type").unwrap_or_default();
+                            let is_nullable: String = row.try_get("is_nullable").unwrap_or_else(|_| "YES".to_string());
+                            ColumnInfo { name, data_type, is_nullable: is_nullable.to_uppercase() == "YES" }
+                        }).collect();
+                        Ok(columns)
                     })
-                    .collect()
-            } else {
-                rows.iter()
-                    .map(|row| {
-                        let name: String = row.try_get("name").unwrap_or_default();
-                        let data_type: String = row.try_get("data_type").unwrap_or_default();
-                        let is_nullable: String = row.try_get("is_nullable").unwrap_or_else(|_| "YES".to_string());
-                        ColumnInfo {
-                            name,
-                            data_type,
-                            is_nullable: is_nullable.to_uppercase() == "YES",
-                        }
+                } else {
+                    Err(anyhow!("Pool type mismatch"))
+                }
+            }
+            DatabaseType::MySQL => {
+                let sql = format!(
+                    "SELECT column_name as name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' AND table_schema = DATABASE() ORDER BY ordinal_position",
+                    table_name
+                );
+                self.log(&format!("Describing table with: {}", sql));
+
+                if let DatabasePool::MySQL(pool) = &self.pool {
+                    self.runtime.block_on(async {
+                        let rows: Vec<MySqlRow> = sqlx::query(&sql).fetch_all(pool).await?;
+                        let columns: Vec<ColumnInfo> = rows.iter().map(|row| {
+                            let name: String = row.try_get("name").unwrap_or_default();
+                            let data_type: String = row.try_get("data_type").unwrap_or_default();
+                            let is_nullable: String = row.try_get("is_nullable").unwrap_or_else(|_| "YES".to_string());
+                            ColumnInfo { name, data_type, is_nullable: is_nullable.to_uppercase() == "YES" }
+                        }).collect();
+                        Ok(columns)
                     })
-                    .collect()
-            };
+                } else {
+                    Err(anyhow!("Pool type mismatch"))
+                }
+            }
+            DatabaseType::SQLite => {
+                let sql = format!("PRAGMA table_info({})", table_name);
+                self.log(&format!("Describing table with: {}", sql));
 
-            Ok(columns)
-        });
-
-        result
+                if let DatabasePool::SQLite(pool) = &self.pool {
+                    self.runtime.block_on(async {
+                        let rows: Vec<SqliteRow> = sqlx::query(&sql).fetch_all(pool).await?;
+                        let columns: Vec<ColumnInfo> = rows.iter().map(|row| {
+                            let name: String = row.try_get("name").unwrap_or_default();
+                            let data_type: String = row.try_get("type").unwrap_or_default();
+                            let notnull: i32 = row.try_get("notnull").unwrap_or(0);
+                            ColumnInfo { name, data_type, is_nullable: notnull == 0 }
+                        }).collect();
+                        Ok(columns)
+                    })
+                } else {
+                    Err(anyhow!("Pool type mismatch"))
+                }
+            }
+        }
     }
 }
 
@@ -458,11 +653,41 @@ impl McpServer for SqlServer {
     }
 }
 
+/// Connect to database and return native pool
+pub async fn connect_database(connection_string: &str, db_type: DatabaseType, timeout: Duration) -> Result<DatabasePool> {
+    match db_type {
+        DatabaseType::PostgreSQL => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(timeout)
+                .connect(connection_string)
+                .await?;
+            Ok(DatabasePool::PostgreSQL(pool))
+        }
+        DatabaseType::MySQL => {
+            let pool = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(timeout)
+                .connect(connection_string)
+                .await?;
+            Ok(DatabasePool::MySQL(pool))
+        }
+        DatabaseType::SQLite => {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(timeout)
+                .connect(connection_string)
+                .await?;
+            Ok(DatabasePool::SQLite(pool))
+        }
+    }
+}
+
 /// Create and run the SQL MCP server
 pub fn run_sql_server(config: SqlServerConfig) -> Result<()> {
     if config.verbose {
         eprintln!("[mcpz] SQL server configuration:");
-        eprintln!("[mcpz]   Database: {}", config.database_type());
+        eprintln!("[mcpz]   Database: {}", config.db_type.name());
         eprintln!("[mcpz]   Access mode: {:?}", config.access_mode);
         eprintln!("[mcpz]   Timeout: {:?}", config.timeout);
     }
@@ -470,20 +695,15 @@ pub fn run_sql_server(config: SqlServerConfig) -> Result<()> {
     // Create tokio runtime for async SQL operations
     let runtime = tokio::runtime::Runtime::new()?;
 
-    // Install any driver support
-    sqlx::any::install_default_drivers();
-
-    // Connect to database
-    let pool = runtime.block_on(async {
-        sqlx::any::AnyPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(config.timeout)
-            .connect(&config.connection_string)
-            .await
-    })?;
+    // Connect to database using native driver
+    let pool = runtime.block_on(connect_database(
+        &config.connection_string,
+        config.db_type,
+        config.timeout,
+    ))?;
 
     if config.verbose {
-        eprintln!("[mcpz] Connected to database successfully");
+        eprintln!("[mcpz] Connected to {} database successfully", config.db_type.name());
     }
 
     let server = SqlServer::new(config, pool, runtime);
@@ -495,46 +715,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sql_config_database_type() {
-        let config = SqlServerConfig::new(
-            "postgres://localhost/test".to_string(),
-            AccessMode::ReadOnly,
-            30,
-            false,
+    fn test_database_type_detection() {
+        assert_eq!(
+            DatabaseType::from_connection_string("postgres://localhost/test").unwrap(),
+            DatabaseType::PostgreSQL
         );
-        assert_eq!(config.database_type(), "PostgreSQL");
-
-        let config = SqlServerConfig::new(
-            "postgresql://localhost/test".to_string(),
-            AccessMode::ReadOnly,
-            30,
-            false,
+        assert_eq!(
+            DatabaseType::from_connection_string("postgresql://localhost/test").unwrap(),
+            DatabaseType::PostgreSQL
         );
-        assert_eq!(config.database_type(), "PostgreSQL");
-
-        let config = SqlServerConfig::new(
-            "mysql://localhost/test".to_string(),
-            AccessMode::ReadOnly,
-            30,
-            false,
+        assert_eq!(
+            DatabaseType::from_connection_string("mysql://localhost/test").unwrap(),
+            DatabaseType::MySQL
         );
-        assert_eq!(config.database_type(), "MySQL");
-
-        let config = SqlServerConfig::new(
-            "sqlite:///tmp/test.db".to_string(),
-            AccessMode::ReadOnly,
-            30,
-            false,
+        assert_eq!(
+            DatabaseType::from_connection_string("mariadb://localhost/test").unwrap(),
+            DatabaseType::MySQL
         );
-        assert_eq!(config.database_type(), "SQLite");
-
-        let config = SqlServerConfig::new(
-            "sqlite::memory:".to_string(),
-            AccessMode::ReadOnly,
-            30,
-            false,
+        assert_eq!(
+            DatabaseType::from_connection_string("sqlite:///tmp/test.db").unwrap(),
+            DatabaseType::SQLite
         );
-        assert_eq!(config.database_type(), "SQLite");
+        assert_eq!(
+            DatabaseType::from_connection_string("sqlite::memory:").unwrap(),
+            DatabaseType::SQLite
+        );
+        assert!(DatabaseType::from_connection_string("unknown://localhost").is_err());
     }
 
     #[test]
@@ -544,7 +750,7 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
         // Allowed in readonly
         assert!(config.is_statement_allowed("SELECT * FROM users"));
@@ -574,7 +780,7 @@ mod tests {
             AccessMode::FullAccess,
             30,
             false,
-        );
+        ).unwrap();
 
         // All allowed in fullaccess
         assert!(config.is_statement_allowed("SELECT * FROM users"));
@@ -588,10 +794,10 @@ mod tests {
     #[test]
     fn test_sql_server_tools_readonly() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
         let pool = runtime.block_on(async {
-            sqlx::any::AnyPoolOptions::new()
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap()
@@ -602,9 +808,9 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
         let tools = server.tools();
 
         // Should have query, list_tables, describe_table but NOT execute
@@ -618,10 +824,10 @@ mod tests {
     #[test]
     fn test_sql_server_tools_fullaccess() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
         let pool = runtime.block_on(async {
-            sqlx::any::AnyPoolOptions::new()
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap()
@@ -632,9 +838,9 @@ mod tests {
             AccessMode::FullAccess,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
         let tools = server.tools();
 
         // Should have all 4 tools including execute
@@ -648,12 +854,10 @@ mod tests {
     #[test]
     fn test_sql_server_query_sqlite() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
-        // Use shared cache for in-memory SQLite to persist across connections
         let pool = runtime.block_on(async {
-            let pool = sqlx::any::AnyPoolOptions::new()
-                .max_connections(1)  // Single connection ensures same in-memory db
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap();
@@ -677,9 +881,9 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
 
         // Test query
         let result = server.execute_query("SELECT * FROM test ORDER BY id").unwrap();
@@ -690,10 +894,9 @@ mod tests {
     #[test]
     fn test_sql_server_readonly_blocks_write() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
         let pool = runtime.block_on(async {
-            let pool = sqlx::any::AnyPoolOptions::new()
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
@@ -712,9 +915,9 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
 
         // Try to execute write statement
         let result = server.execute_statement("INSERT INTO test (id) VALUES (1)");
@@ -725,10 +928,9 @@ mod tests {
     #[test]
     fn test_sql_server_list_tables_sqlite() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
         let pool = runtime.block_on(async {
-            let pool = sqlx::any::AnyPoolOptions::new()
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
@@ -752,9 +954,9 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
 
         let tables = server.list_tables().unwrap();
         assert_eq!(tables.len(), 2);
@@ -765,10 +967,9 @@ mod tests {
     #[test]
     fn test_sql_server_describe_table_sqlite() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
         let pool = runtime.block_on(async {
-            let pool = sqlx::any::AnyPoolOptions::new()
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
@@ -787,9 +988,9 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
 
         let columns = server.describe_table("users").unwrap();
         assert_eq!(columns.len(), 3);
@@ -807,10 +1008,9 @@ mod tests {
     #[test]
     fn test_sql_server_call_tool_query() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
         let pool = runtime.block_on(async {
-            let pool = sqlx::any::AnyPoolOptions::new()
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
@@ -834,9 +1034,9 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
 
         let result = server.call_tool("query", &serde_json::json!({"sql": "SELECT * FROM test"})).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -847,10 +1047,10 @@ mod tests {
     #[test]
     fn test_sql_server_initialize() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        sqlx::any::install_default_drivers();
 
         let pool = runtime.block_on(async {
-            sqlx::any::AnyPoolOptions::new()
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap()
@@ -861,9 +1061,9 @@ mod tests {
             AccessMode::ReadOnly,
             30,
             false,
-        );
+        ).unwrap();
 
-        let server = SqlServer::new(config, pool, runtime);
+        let server = SqlServer::new(config, DatabasePool::SQLite(pool), runtime);
         let result = server.handle_initialize();
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["serverInfo"]["name"], "mcpz-sql");
